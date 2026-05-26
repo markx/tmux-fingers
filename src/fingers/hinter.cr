@@ -21,6 +21,7 @@ module Fingers
     @hints : Array(String) | Nil
     @n_matches : Int32 | Nil
     @reuse_hints : Bool
+    @continuation_by_line : Hash(Int32, String)
 
     def initialize(
       input : Array(String),
@@ -37,6 +38,7 @@ module Fingers
       @width = width
       @target_by_hint = {} of String => Target
       @target_by_text = {} of String => Target
+      @continuation_by_line = {} of Int32 => String
       @state = state
       @output = output
       @formatter = formatter
@@ -78,7 +80,22 @@ module Fingers
 
     def process_line(line, line_index, ending)
       tab_positions = tab_positions_for(line)
-      result = line.gsub(pattern) { |_m| replace($~, line_index) }
+      
+      if hint = @continuation_by_line[line_index]?
+        selected = state.selected_hints.includes?(hint)
+        style = selected ? Fingers.config.selected_highlight_style : Fingers.config.highlight_style
+        
+        if line_match = line.match(/^(\s{2})(?!\s)(.*\S)/)
+          indent = line_match[1]
+          text = line_match[2]
+          result = indent + style + text + "\e[0m" + Fingers.config.backdrop_style
+        else
+          result = line.gsub(pattern) { |_m| replace($~, line_index) }
+        end
+      else
+        result = line.gsub(pattern) { |_m| replace($~, line_index) }
+      end
+      
       initial_length = result.size
       result = expand_tabs(result, tab_positions)
       tab_correction = result.size - initial_length
@@ -111,8 +128,36 @@ module Fingers
     def replace(match, line_index)
       text = match[0]
 
-      captured_text = captured_text_for_match(match)
-      relative_capture_offset = relative_capture_offset_for_match(match, captured_text)
+      original_captured_text = captured_text_for_match(match)
+      relative_capture_offset = relative_capture_offset_for_match(match, original_captured_text)
+
+      captured_text = original_captured_text
+      continuation_indices = [] of Int32
+      
+      next_index = line_index + 1
+      while next_index < lines.size
+        next_line = lines[next_index]
+        if next_line_match = next_line.match(/^\s{2}(?!\s)(.*\S)/)
+          continuation = next_line_match[1]
+          
+          # Stop if the continuation line is a divider
+          if continuation.match(/^[─━\-=_*]{3,}$/)
+            break
+          end
+          
+          captured_text = captured_text.sub(/\s*\\$/, "")
+          captured_text = captured_text.sub(/ {0,2}$/, "")
+          
+          # Join without space if ending with connecting punctuation (- / = : .)
+          separator = captured_text.match(%r{[-/=:.]$}) ? "" : " "
+          captured_text = "#{captured_text}#{separator}#{continuation}"
+          
+          continuation_indices << next_index
+          next_index += 1
+        else
+          break
+        end
+      end
 
       absolute_offset = {
         line_index,
@@ -121,10 +166,14 @@ module Fingers
 
       hint = hint_for_text(captured_text)
 
-      # hint is longer than highlighted text, put it back in hint stack
-      if hint.size > captured_text.size
+      if hint.size > original_captured_text.size
         hints.push(hint)
         return text
+      end
+
+      # Register this hint on all its continuation line indices
+      continuation_indices.each do |idx|
+        @continuation_by_line[idx] = hint
       end
 
       build_target(captured_text, hint, absolute_offset)
